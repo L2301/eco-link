@@ -20,11 +20,25 @@
     ?:  (is-frozen state from.tx)
       [%.n 1 state]  :: Failed, account is frozen
     ::  Freeze account
+    =/  from-balance  (~(gut by balances.state) from.tx 0)
+    ::  Check has funds to freeze
+    ?:  =(from-balance 0)
+        [%.n 1 state]
+    ::  Deduct balance (funds held in frozen-data, not credited to layer yet)
+    =/  new-balances  (~(put by balances.state) from.tx 0)
+    ::  Create frozen-data
+    =/  freeze-data=frozen-data
+        :*  amount=from-balance
+            layer=target-layer.tx
+            freeze-block=current-height.state
+            last-update=current-height.state
+        ==
     =/  current-info  (~(gut by roll-call.state) from.tx *info)
-    =/  new-info=info  [frozen=%.y]
+    =/  new-info=info
+      current-info(frozen %.y, frozen-data `freeze-data)
     =/  new-roll-call  (~(put by roll-call.state) from.tx new-info)
     =/  new-nonces  (~(put by nonces.state) from.tx +(nonce.tx))
-    =/  new-state  state(roll-call new-roll-call)
+    =/  new-state  state(roll-call new-roll-call, nonces new-nonces)
     [%.y 1 new-state]  :: Success, return new state
 ::
 ++  thaw
@@ -64,6 +78,78 @@
   ?:  (~(has by contracts.state) current)
     $(attempt +(attempt))
   current
+::
+++  get-signature
+  |=  tx=link-transaction
+  ^-  (unit @ux)
+  ?-  -.tx
+    %transfer  `signature.tx
+    %deploy    `signature.tx
+    %call      `signature.tx
+    %freeze    `signature.tx
+    %thaw      `signature.tx
+    %melt      ~
+    %spawn     ~
+    %dissolve  ~
+    %create-layer  ~
+  ==
+::
+++  get-from-address
+  |=  tx=link-transaction
+  ^-  (unit @p)
+  ?-  -.tx
+    %transfer  `from.tx
+    %deploy    `from.tx
+    %call      `from.tx
+    %freeze    `from.tx
+    %thaw      `from.tx
+    %melt      ~
+    %spawn     ~
+    %dissolve  ~
+    %create-layer  ~
+  ==
+::
+++  get-nonce
+  |=  tx=link-transaction
+  ^-  (unit @ud)
+  ?-  -.tx
+    %transfer  `nonce.tx
+    %deploy    `nonce.tx
+    %call      `nonce.tx
+    %freeze    `nonce.tx
+    %thaw      `nonce.tx
+    %melt      ~
+    %spawn     ~
+    %dissolve  ~
+    %create-layer  ~
+  ==
+::
+++  strip-signature
+  |=  tx=link-transaction
+  ^-  *
+  ?-  -.tx
+    %transfer  [%transfer from.tx to.tx amount.tx nonce.tx]
+    %deploy    [%deploy from.tx code.tx initial-state.tx nonce.tx]
+    %call      [%call from.tx contract.tx method.tx args.tx nonce.tx]
+    %freeze    [%freeze from.tx nonce.tx]
+    %thaw      [%thaw from.tx nonce.tx]
+    %melt      [%melt from.tx zkp.tx nonce.tx block-height.tx type.tx]
+    %spawn     tx
+    %dissolve  tx
+    %create-layer  tx
+  ==
+::
+++  validate-signature
+  |=  [state=link-state tx=link-transaction]
+  ^-  ?
+  =/  from  (get-from-address tx)
+  ?~  from  %.n  :: No from address means system tx, shouldn't call this
+  =/  sig  (get-signature tx)
+  ?~  sig  %.n  :: No signature
+  =/  account-info  (~(got by roll-call.state) u.from)
+  =/  msg=@  (sham (strip-signature tx))
+  ::  verify using ed25519
+  (veri:ed:crypto u.sig msg pass.account-info)
 ::
 ++  execute-transfer
   |=  [state=link-state tx=link-transaction]
@@ -153,6 +239,21 @@
 ++  execute-transaction
   |=  [state=link-state tx=link-transaction]
   ^-  execution-result
+  ?:  ?=(?(%spawn %dissolve %create-layer %melt) -.tx)
+    ?-  -.tx
+      %spawn  [%.y 0 state]  :: TODO: implement
+      %dissolve  [%.y 0 state]  :: TODO: implement
+      %create-layer  [%.y 0 state]  :: TODO: implement
+      %melt  [%.y 0 state]  :: TODO: implement
+    ==
+  ::  Validate signature
+  ?.  (validate-signature state tx)
+    [%.n 0 state]  :: Failed, invalid signature
+  ::  check nonce
+  =/  current-nonce  (~(gut by nonces.state) from.tx 0)
+  =/  nonce  (get-nonce tx)
+  ?.  =(nonce current-nonce)
+    [%.n 0 state]  :: Failed, invalid nonce
   ?-  -.tx
     %transfer
     (execute-transfer state tx)
@@ -166,10 +267,79 @@
     (thaw state tx)
   ==
 ::
++|  %block
+::
++$  block
+  $:  hash=@uvH
+      parent-hash=@uvH
+      height=@ud
+      timestamp=@da
+      transactions=(list link-transaction)
+      consensus-data=consensus-proof
+      state-root=@uvH
+      creator=@p
+  ==
+::
++$  consensus-proof
+  $%  [%nakamoto nonce=@ud difficulty=@ud]
+  ==
+::
++$  chain-state
+  $:  blocks=(map @uvH block)
+      block-height=(map @ud @uvH)  :: height -> block hash
+      best-tip=@uvH
+==
+::
++|  %consensus
+::
+++  validate-consensus
+  |=  [blk=block parent=block target-difficulty=@ud]
+  ^-  ?
+  ?>  ?=(%nakamoto -.consensus-data.blk)
+  ::  Check timestamp is after parent
+  ?.  (gth timestamp.blk timestamp.parent)
+    %.n
+  ::  Check height increments correctly
+  ?.  =(height.blk +(height.parent))
+    %.n
+  ::  Check hash meets difficulty (leading zeros)
+  ::  Lower hash value = more leading zeros = harder to find
+  =/  hash-num=@  `@`hash.blk
+  =/  target=@  (sub (bex 256) (bex (sub 256 target-difficulty)))
+  (lte hash-num target)
+::
+++  compute-block-hash
+  |=  blk=block
+  ^-  @uvH
+  ::  Hash everything except the hash field itself
+  =/  hashable
+    :*  parent-hash.blk
+        height.blk
+        timestamp.blk
+        transactions.blk
+        consensus-data.blk
+        state-root.blk
+        creator.blk
+    ==
+  `@uvH`(sham hashable)
+::
+++  compute-state-root
+  |=  ls=link-state
+  ^-  @uvH
+  ::  Hash the entire world state
+  `@uvH`(sham [balances.ls contracts.ls nonces.ls roll-call.ls])
+::
+++  difficulty-target
+  |=  difficulty=@ud
+  ^-  @
+  ::  Convert difficulty (number of leading zero bits) to target number
+  ::  Higher difficulty = smaller target = harder to find valid hash
+  (sub (bex 256) (bex (sub 256 difficulty)))
+::
 --
 
 ::
-=|  state=link-state
+=|  state=[link-state=link-state chain-state=chain-state mempool=(list link-transaction)]
 |=  [now=@da eny=@uvJ rof=*]                :: simplified roof type
 |%
 ::  Vane interface
@@ -189,8 +359,8 @@
     [~ link-gate]
   ::
     %execute-transaction
-    =/  executed  (execute-transaction state tx.task)
-    :_  link-gate(state new-state.executed)
+    =/  executed  (execute-transaction link-state.state tx.task)
+    :_  link-gate(link-state.state new-state.executed)
     :~  [duct %give [%.y !>([%transaction-executed result=executed])]]
     ==
   ==
